@@ -6,7 +6,12 @@ export default async function Home() {
   const client = await createMondayClient();
   try {
     const { tools } = await client.listTools();
-    console.log(tools);
+    console.log(
+      await client.callTool({
+        name: 'get_board_items_page',
+        arguments: { boardId: 1151042058 },
+      }),
+    );
   } catch (err) {
     console.error(err);
   } finally {
@@ -16,6 +21,7 @@ export default async function Home() {
   const rpsClient = await createRpsClient();
   try {
     const { tools } = await rpsClient.listTools();
+    console.log(tools);
     console.log(
       await rpsClient.callTool({ name: 'play', arguments: { choice: 'rock' } }),
     );
