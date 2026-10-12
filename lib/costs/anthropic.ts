@@ -1,17 +1,6 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import { PRICES } from './pricing';
-
-export type RequestCost = {
-  provider: 'anthropic' | 'openai';
-  model: string;
-  inputTokens: number;
-  outputTokens: number;
-  thinkingTokens: number;
-  cacheReadTokens: number;
-  cacheWrite5mTokens: number;
-  cacheWrite1hTokens: number;
-  costUsd: number | null; // null if the model isn't in PRICES
-};
+import type { RequestCost } from './types';
 
 export function anthropicRequestCost(
   message: Anthropic.Beta.BetaMessage,

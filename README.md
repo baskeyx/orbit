@@ -4,6 +4,8 @@ A Next.js app experimenting with AI agents that complete real tasks using [MCP](
 
 The first working example: an agent reads a ticket on a monday.com board, works out what it asks for, completes it with the tools it has, and marks the ticket as done. Nothing about the task itself is written in code; the agent decides how to complete it.
 
+The second example uses the same approach with three MCP servers at once: an agent [picks a tennis slot](#second-example-picking-a-tennis-slot) by checking coaching sessions, the weather and the user's calendar.
+
 ## Demo
 
 The monday.com board has one ticket, **"Win one hand of rock, paper, scissors"**, with status _Not Started_:
@@ -27,6 +29,53 @@ And the board afterwards:
 
 ![monday.com board after the agent runs, with the ticket marked Done](public/monday-board-after.png)
 
+## Second example: picking a tennis slot
+
+The ticket is **"Pick the best possible slot for tennis over the next week"**. To do it, the agent has three local MCP servers, each with one tool:
+
+| Server | Tool | Data source |
+|---|---|---|
+| `lib/mcp/servers/tennis.ts` | `get_tennis_sessions` | ClubSpark's (undocumented) coaching search API, filtered to adult sessions at Clissold Park with places left |
+| `lib/mcp/servers/weather.ts` | `get_weather_forecast` | Open-Meteo's hourly forecast for Clissold Park (about 15 days ahead, no API key) |
+| `lib/mcp/servers/calendar.ts` | `get_busy_times` | The Google Calendar "secret address in iCal format" feed. Only busy start and end times are returned; event titles never leave the server. |
+
+All three tools take the same `{ start, end }` window (`lib/mcp/servers/time-window.ts`, in UTC), so the agent can pass one window to each. Run it with `GET /api/agent2`.
+
+The model has no clock, so the first run guessed a date from its training data and searched January 2025. `app/api/agent2/route.ts` now puts the current London and UTC time in the user message.
+
+### Result
+
+> **Best Tennis Slot Identified:**
+> - **Friday, October 16, 2026 at 09:00-10:00 UTC (10:00-11:00 AM London time)**
+> - **Session:** Adult Intermediate Drop In
+> - **Places available:** 11 out of 12
+> - **Booking link:** Available via Clubspark
+>
+> **Note:** This is the only adult tennis session with available places during the week. While the weather shows light rain showers that morning (27% chance, 11.2°C), conditions improve by mid-afternoon.
+
+The answer was right: calling the underlying functions directly confirmed it was the only adult session with places left that week. The summary could still be better:
+
+- **Say what it checked.** It didn't say whether the user was free at that time.
+- **Keep the booking link.** The tool returned the session URL, but the summary just said "Available via Clubspark".
+- **Say when there's no choice to make.** With only one session that week, the weather and calendar couldn't change the answer. The tennis server could also return court bookings to give the agent real options.
+
+These are now in the tennis agent's own system prompt (`lib/mcp/agents/tennis-agent.ts`). For the chosen session, it gives the name, London time, places left and booking URL, plus a line each on whether the user is free and the weather. It says when there's only one session. If a tool fails, it says which tool and what the error was.
+
+### Passing secrets to stdio servers
+
+`StdioClientTransport` doesn't pass the app's environment to the servers it starts, only a short default list (`HOME`, `PATH` and so on). So the agent reads `GOOGLE_CALENDAR_ICS_URL`, checks it's set, and passes it to the calendar server alone:
+
+```ts
+createStdioClient('calendar', { GOOGLE_CALENDAR_ICS_URL: calendarUrl });
+```
+
+This works like the monday.com client: the host holds the secrets and gives each server only what it needs. An HTTP server gets a token with every request (`authProvider`). A stdio server gets its secrets as env variables when it starts.
+
+### Lessons
+
+- **Give the agent the date.** It doesn't know it, and it won't say it's guessing.
+- **Check the tool results, not just the summary.** A plausible answer isn't necessarily a verified one.
+
 ## Installation
 
 ### Requirements
@@ -49,9 +98,10 @@ And the board afterwards:
    ```bash
    MONDAY_API_TOKEN=your-monday-api-token
    ANTHROPIC_API_KEY=your-anthropic-api-key
+   GOOGLE_CALENDAR_ICS_URL=your-calendar-secret-ical-address
    ```
 
-   `.env*` files are gitignored. Neither variable has a `NEXT_PUBLIC_` prefix, so both stay on the server and are never sent to the browser.
+   `.env*` files are gitignored. No variable has a `NEXT_PUBLIC_` prefix, so they all stay on the server and are never sent to the browser. `GOOGLE_CALENDAR_ICS_URL` is only needed for the tennis example: in Google Calendar, go to Settings → your calendar → _Secret address in iCal format_. Treat it like a password, because anyone with it can read the calendar.
 
 3. Set `BOARD_ID` in `lib/mcp/agents/anthropic.ts` to your monday.com board's ID. It's the number in the board's URL.
 
@@ -61,7 +111,7 @@ And the board afterwards:
    pnpm dev
    ```
 
-5. Run the agent by opening [http://localhost:3000/api/agent](http://localhost:3000/api/agent). The final response is returned as JSON. Every tool call and the token count and cost of every request are logged in the terminal running `pnpm dev`.
+5. Run the agent by opening [http://localhost:3000/api/agent](http://localhost:3000/api/agent) (rock-paper-scissors) or [http://localhost:3000/api/agent2](http://localhost:3000/api/agent2) (tennis). The final response is returned as JSON. Every tool call and the token count and cost of every request are logged in the terminal running `pnpm dev`.
 
 The agent only works on tasks whose status isn't _Done_, so set the ticket back to _Not Started_ between runs.
 
@@ -70,11 +120,14 @@ The agent only works on tasks whose status isn't _Done_, so set the ticket back 
 ```
 Orbit (MCP host)
 ├── Anthropic Tool Runner ── Claude (claude-haiku-4-5)
-├── MCP client ──stdio──► lib/mcp/rps-server.ts   (our rock-paper-scissors server)
-└── MCP client ──HTTP───► mcp.monday.com/mcp      (monday.com's hosted server)
+├── MCP client ──stdio──► lib/mcp/servers/rps-server.ts   (rock-paper-scissors, agent 1)
+├── MCP client ──stdio──► lib/mcp/servers/tennis.ts       (agent 2)
+├── MCP client ──stdio──► lib/mcp/servers/calendar.ts     (agent 2)
+├── MCP client ──stdio──► lib/mcp/servers/weather.ts      (agent 2)
+└── MCP client ──HTTP───► mcp.monday.com/mcp              (monday.com's hosted server, both agents)
 ```
 
-The app is the MCP **host**. It holds one MCP **client** per server, collects the tools the agent needs, and gives them to Claude. The Anthropic SDK's Tool Runner then runs the agent loop: Claude asks for a tool, the runner calls it through the right MCP client and sends back the result, and this repeats until Claude is finished.
+The app is the MCP **host**. It holds one MCP **client** per server (a client connects to exactly one server), collects the tools the agent needs, and gives them to Claude. The Anthropic SDK's Tool Runner then runs the agent loop: Claude asks for a tool, the runner calls it through the right MCP client and sends back the result, and this repeats until Claude is finished.
 
 Before the loop starts, the app fetches the board's open tasks itself. That step is always the same, so it doesn't need the model. See [Cost optimisation](#cost-optimisation) for why.
 
@@ -82,10 +135,16 @@ Before the loop starts, the app fetches the board's open tasks itself. That step
 
 | File | Purpose |
 |---|---|
-| `lib/mcp/rps-server.ts` | An MCP server exposing a `play` tool. Uses `StdioServerTransport`, so it runs as a standalone process and communicates over stdin/stdout. |
-| `lib/mcp/rps.ts` | MCP client for the RPS server. `StdioClientTransport` launches `rps-server.ts` as a child process with `npx tsx`. |
-| `lib/mcp/monday.ts` | MCP client for monday.com's hosted server, over Streamable HTTP, authenticated with `MONDAY_API_TOKEN` as a bearer token. |
-| `lib/mcp/agents/anthropic.ts` | The agent. Fetches the open tasks, filters monday.com's tools down to an allowlist, and runs Claude through `client.beta.messages.toolRunner()`, logging each request's cost. |
+| `lib/mcp/servers/rps-server.ts` | An MCP server exposing a `play` tool. Uses `StdioServerTransport`, so it runs as a standalone process and communicates over stdin/stdout. |
+| `lib/mcp/servers/{tennis,calendar,weather}.ts` | The tennis example's MCP servers, one tool each. They're thin wrappers around `lib/tennis/clubspark.ts`, `lib/calendar/google.ts` and `lib/weather/openMeteo.ts`. |
+| `lib/mcp/servers/time-window.ts` | The shared `{ start, end }` input schema. It rejects a window where `end` isn't after `start`, which would otherwise return nothing and look like "free". |
+| `lib/mcp/clients/stdio.ts` | `createStdioClient(server, env)`: one factory for all the local servers. Launches `lib/mcp/servers/<server>.ts` as a child process with `npx tsx`, passing only the env variables it's given. |
+| `lib/mcp/clients/connect.ts` | `connectAll()`: connects several clients in parallel and returns one `close()`. If any connection fails, it closes the ones that succeeded so no child process is left running. |
+| `lib/mcp/clients/monday.ts` | MCP client for monday.com's hosted server, over Streamable HTTP, authenticated with `MONDAY_API_TOKEN` as a bearer token. It has its own file because it uses a different transport and needs auth. |
+| `lib/mcp/agents/anthropic.ts` | The RPS agent. Fetches the open tasks, filters monday.com's tools down to an allowlist, and runs Claude through `client.beta.messages.toolRunner()`, logging each request's cost. |
+| `lib/mcp/agents/tennis-agent.ts` | The tennis agent. The same loop, with the tennis, calendar and weather tools. |
+| `app/api/agent2/route.ts` | `GET /api/agent2`, which runs the tennis agent with the current date and time in the prompt. |
+| `app/api/{tennis,calendar,weather}/route.ts` | Debug routes that call each data source directly for a fixed date range, without the agent or MCP. |
 | `lib/costs/pricing.ts` | Per-model token prices in USD per million tokens. |
 | `lib/costs/anthropic.ts` | Turns a response's `usage` into a provider-neutral `RequestCost` record with a dollar amount. |
 | `app/api/agent/route.ts` | `GET /api/agent`, which runs the agent with the prompt _"Complete my tasks."_ |
@@ -162,8 +221,10 @@ The API doesn't return prices, so `pricing.ts` has to be kept up to date by hand
 Inspect and call the RPS server's tools in a browser UI with the MCP Inspector:
 
 ```bash
-npx @modelcontextprotocol/inspector npx tsx lib/mcp/rps-server.ts
+npx @modelcontextprotocol/inspector npx tsx lib/mcp/servers/rps-server.ts
 ```
+
+The same command works for `tennis.ts`, `calendar.ts` and `weather.ts`.
 
 Or call a tool from code through an MCP client:
 
@@ -180,7 +241,11 @@ try {
 ## Notes and gotchas
 
 - **Never `console.log` in a stdio MCP server.** stdout is the protocol channel, so a stray log line breaks the connection. Use `console.error` instead.
-- **Each client launches a new process.** Every `createRpsClient()` starts a fresh `rps-server.ts` process, so always call `client.close()` (in a `finally` block) to shut it down. This also means the stdio setup only works where the app can spawn processes (local dev or your own server), not on serverless hosting.
+- **Each client launches a new process.** Every stdio client starts a fresh server process (about a second each with `npx tsx`, which is why `connectAll()` connects them in parallel), so always call `close()` (in a `finally` block) to shut them down.
+- **Stdio servers don't inherit your `.env`.** `StdioClientTransport` only passes a default set of variables (`HOME`, `PATH` and so on). Pass anything else a server needs through the transport's `env` option. See [Passing secrets to stdio servers](#passing-secrets-to-stdio-servers).
+- **The model doesn't know today's date.** Put it in the prompt, or relative requests like "next week" fall back to a date from the model's training data.
+- **Tool names must be unique across servers.** `mcpTools()` passes names through unchanged, so give each tool a name that includes its domain (`get_tennis_sessions`, not `get_sessions`).
+- **The client's `name` and `version` identify the app, not the server.** They're sent as `clientInfo` when the connection starts, so every client uses `orbit` / `0.1.0`. Each server reports its own name back as `serverInfo`. This also means the stdio setup only works where the app can spawn processes (local dev or your own server), not on serverless hosting.
 - **SDK type mismatch.** The Anthropic SDK's `mcpTools()` helper types its client argument as `MCPClientLike`, which was written for the older MCP SDK. The v2 `Client`'s `callTool()` result types `structuredContent` as `unknown`, so TypeScript rejects it even though it works at runtime. `toMcpClientLike()` in `lib/mcp/agents/anthropic.ts` wraps the client with a narrow cast.
 - **Model configs need the SDK's types.** Moving parameters like `output_config: { effort: 'medium' }` into a separate object widens `'medium'` to `string`, which `toolRunner()` rejects. The `ModelConfig` type keeps the exact values.
 - **`zod/v4` is an import path, not a package name.** Install `zod` (`pnpm add zod`). `pnpm add zod/v4` is read as a GitHub repo shorthand.
@@ -194,3 +259,7 @@ try {
 - Return each run's costs from `/api/agent` and save them, so runs can be compared over time.
 - Try the same MCP servers with an OpenAI agent to compare providers.
 - Move `rps-server.ts` to Streamable HTTP so it can be deployed and connected to by URL.
+- Rerun the tennis agent with the calendar working and the new prompt, and add the result here.
+- For a hosted version that others can use with their own calendars: replace the single `GOOGLE_CALENDAR_ICS_URL` with Google sign-in, and move the calendar server to Streamable HTTP so each request carries the user's token (as monday.com's server does).
+- Log each tool result's `isError`, not just the calls, so a failed tool can't be hidden by a confident summary.
+- Make the weather tool's error say that dates must be within the next ~15 days, so the model can correct a bad window itself.

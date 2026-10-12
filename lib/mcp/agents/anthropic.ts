@@ -1,14 +1,16 @@
 import 'server-only';
 import Anthropic from '@anthropic-ai/sdk';
-import { createRpsClient } from '../rps';
-import { createMondayClient } from '../monday';
+import { createRpsClient } from '../clients/rps';
+import { createMondayClient } from '../clients/monday';
 import type { Client } from '@modelcontextprotocol/client';
 import {
   mcpTools,
   type MCPClientLike,
   type MCPCallToolResultLike,
 } from '@anthropic-ai/sdk/helpers/beta/mcp';
-import { anthropicRequestCost, type RequestCost } from '@/lib/costs/anthropic';
+import { anthropicRequestCost } from '@/lib/costs/anthropic';
+import { summariseRun } from '@/lib/costs/summary';
+import type { RequestCost, RunSummary } from '@/lib/costs/types';
 
 const BOARD_ID = 1151042058;
 
@@ -70,8 +72,18 @@ const claudeHaiki45: ModelConfig = {
   //thinking: { type: 'adaptive' }
 };
 
-export async function runAnthropicAgent(prompt: string) {
+export type AgentRun = {
+  final: Anthropic.Beta.BetaMessage | null; // null if the run failed
+  requests: RequestCost[];
+  summary: RunSummary;
+  error: string | null;
+};
+
+export async function runAnthropicAgent(prompt: string): Promise<AgentRun> {
   const requests: RequestCost[] = [];
+  let final: Anthropic.Beta.BetaMessage | null = null;
+  let error: string | null = null;
+
   const client = new Anthropic();
   const rps = await createRpsClient();
   const monday = await createMondayClient();
@@ -114,13 +126,22 @@ export async function runAnthropicAgent(prompt: string) {
       }
     }
 
-    const final = await runner.done();
+    final = await runner.done();
     console.log('stop_reason:', final.stop_reason);
-    return final;
-  } catch (error) {
-    console.error(error);
+  } catch (err) {
+    console.error(err);
+    error = err instanceof Error ? err.message : String(err);
   } finally {
     await rps.close();
     await monday.close();
   }
+
+  // Summarised on failure too: requests made before an error are still billed.
+  const summary = summariseRun(requests);
+  console.log(
+    `total: ${summary.requestCount} requests, in ${summary.inputTokens}, out ${summary.outputTokens}` +
+      ` (thinking ${summary.thinkingTokens}), $${summary.costUsd?.toFixed(4) ?? '?'}`,
+  );
+
+  return { final, requests, summary, error };
 }

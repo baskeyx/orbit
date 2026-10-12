@@ -7,7 +7,7 @@ export async function createRpsClient() {
 
   const transport = new StdioClientTransport({
     command: 'npx',
-    args: ['tsx', 'lib/mcp/rps-server.ts'],
+    args: ['tsx', 'lib/mcp/servers/rps-server.ts'],
     cwd: process.cwd(),
   });
 

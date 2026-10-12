@@ -1,0 +1,177 @@
+import 'server-only';
+import Anthropic from '@anthropic-ai/sdk';
+import { createMondayClient } from '../clients/monday';
+import type { Client } from '@modelcontextprotocol/client';
+import {
+  mcpTools,
+  type MCPClientLike,
+  type MCPCallToolResultLike,
+} from '@anthropic-ai/sdk/helpers/beta/mcp';
+import { anthropicRequestCost } from '@/lib/costs/anthropic';
+import { summariseRun } from '@/lib/costs/summary';
+import type { RequestCost, RunSummary } from '@/lib/costs/types';
+import { connectAll } from '../clients/connect';
+import { createStdioClient } from '../clients/stdio';
+
+const BOARD_ID = 1151042058;
+
+// The only monday.com tools the agent is given. Everything else is filtered out.
+const MONDAY_TOOLS = ['change_item_column_values', 'create_update'];
+
+const system = `You complete tasks from the user's monday.com board.
+
+The user's message lists the open tasks on board ${BOARD_ID}. For each task:
+- Do what the task asks, using your tools. If a tool result shows you haven't succeeded yet, keep trying.
+- When the task is complete, set its status to Done with change_item_column_values: boardId ${BOARD_ID}, the task's itemId, and columnValues {"status": {"label": "Done"}}.
+- Don't change any other column, item or board.
+- If a task can't be done with your tools, leave it unchanged and explain why.
+
+When picking a tennis slot:
+- Tool times are UTC. The user is in London, so give times in London time.
+- Only choose a session the user is free for. Prefer one with dry weather.
+- For the chosen session, give its name, London time, places left and booking URL, plus one line each on whether the user is free and what the weather will be.
+- If there is only one session with places, say so instead of calling it the best of several.
+- If a tool returns an error, say which tool failed and what it said. Don't present a choice as checked against data you didn't get.
+- When the task is complete, post the result as a comment with create_update: the task's itemId, and a body in HTML (<p>, <ul>, <li>, <strong>, <a>), not markdown. Don't mention anyone., summarize what you completed and anything you skipped.
+- Then set its status to Done with change_item_column_values`;
+
+type BoardItem = {
+  id: string;
+  name: string;
+  column_values: { status: string | null };
+};
+
+function toMcpClientLike(client: Client): MCPClientLike {
+  return {
+    callTool: (params) =>
+      client.callTool(params) as Promise<MCPCallToolResultLike>,
+  };
+}
+
+// Fetched in code rather than by the agent: this step is always the same, so it
+// doesn't need a model turn, and we can trim the data to just what the agent needs.
+async function getOpenTasks(monday: Client) {
+  const result = await monday.callTool({
+    name: 'get_board_items_page',
+    arguments: { boardId: BOARD_ID, includeColumns: true },
+  });
+  const { items } = result.structuredContent as { items: BoardItem[] };
+
+  return items
+    .filter((item) => item.column_values.status !== 'Done')
+    .map((item) => ({
+      itemId: item.id,
+      task: item.name,
+      status: item.column_values.status,
+    }));
+}
+
+type ModelConfig = Pick<
+  Anthropic.Beta.Messages.MessageCreateParamsNonStreaming,
+  'model' | 'output_config' | 'thinking'
+>;
+
+const claudeOpus55: ModelConfig = {
+  model: 'claude-opus-5-5',
+  output_config: { effort: 'medium' },
+};
+const claudeHaiki45: ModelConfig = {
+  model: 'claude-haiku-4-5-20251001',
+  //thinking: { type: 'adaptive' }
+};
+
+export type AgentRun = {
+  final: Anthropic.Beta.BetaMessage | null; // null if the run failed
+  requests: RequestCost[];
+  summary: RunSummary;
+  error: string | null;
+};
+
+export async function runAnthropicTennisAgent(
+  prompt: string,
+): Promise<AgentRun> {
+  const requests: RequestCost[] = [];
+  let final: Anthropic.Beta.BetaMessage | null = null;
+  let error: string | null = null;
+
+  const client = new Anthropic();
+
+  // Checked before connecting, so a missing value stops the run here instead of
+  // the server starting without it and the agent working around a failed tool.
+  const calendarUrl = process.env.GOOGLE_CALENDAR_ICS_URL;
+  if (!calendarUrl) throw new Error('GOOGLE_CALENDAR_ICS_URL is not set');
+
+  // Clients come back in the order listed. monday.com is kept apart from the
+  // servers so only its allowlisted tools are given to the agent.
+  const {
+    clients: [monday, ...servers],
+    close,
+  } = await connectAll([
+    createMondayClient,
+    () => createStdioClient('tennis'),
+    () =>
+      createStdioClient('calendar', { GOOGLE_CALENDAR_ICS_URL: calendarUrl }),
+    () => createStdioClient('weather'),
+  ]);
+  try {
+    const tools = (
+      await Promise.all(
+        servers.map(async (c) =>
+          mcpTools((await c.listTools()).tools, toMcpClientLike(c)),
+        ),
+      )
+    ).flat();
+
+    const tasks = await getOpenTasks(monday);
+    const mondayTools = (await monday.listTools()).tools.filter((tool) =>
+      MONDAY_TOOLS.includes(tool.name),
+    );
+
+    const runner = client.beta.messages.toolRunner({
+      ...claudeHaiki45,
+      max_tokens: 16000,
+      cache_control: { type: 'ephemeral' },
+      system,
+      tools: [...tools, ...mcpTools(mondayTools, toMcpClientLike(monday))],
+      max_iterations: 20,
+      messages: [
+        {
+          role: 'user',
+          content: `${prompt}\n\nOpen tasks:\n${JSON.stringify(tasks, null, 2)}`,
+        },
+      ],
+    });
+
+    for await (const message of runner) {
+      const cost = anthropicRequestCost(message);
+      requests.push(cost);
+      console.log(
+        `request ${requests.length}: in ${cost.inputTokens}, out ${cost.outputTokens}` +
+          ` (thinking ${cost.thinkingTokens}), $${cost.costUsd?.toFixed(4) ?? '?'}`,
+      );
+
+      for (const block of message.content) {
+        if (block.type === 'tool_use')
+          console.log('→', block.name, block.input);
+        if (block.type === 'text') console.log(block.text);
+      }
+    }
+
+    final = await runner.done();
+    console.log('stop_reason:', final.stop_reason);
+  } catch (err) {
+    console.error(err);
+    error = err instanceof Error ? err.message : String(err);
+  } finally {
+    await close();
+  }
+
+  // Summarised on failure too: requests made before an error are still billed.
+  const summary = summariseRun(requests);
+  console.log(
+    `total: ${summary.requestCount} requests, in ${summary.inputTokens}, out ${summary.outputTokens}` +
+      ` (thinking ${summary.thinkingTokens}), $${summary.costUsd?.toFixed(4) ?? '?'}`,
+  );
+
+  return { final, requests, summary, error };
+}
