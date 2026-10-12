@@ -1,5 +1,5 @@
-import { createMondayClient } from '@/lib/mcp/monday';
-import { createRpsClient } from '@/lib/mcp/rps';
+import { createMondayClient } from '@/lib/mcp/clients/monday';
+import { createRpsClient } from '@/lib/mcp/clients/rps';
 import Image from 'next/image';
 
 export default async function Home() {
