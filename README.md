@@ -148,7 +148,7 @@ Before the loop starts, the app fetches the board's open tasks itself. That step
 | `lib/costs/pricing.ts` | Per-model token prices in USD per million tokens. |
 | `lib/costs/anthropic.ts` | Turns a response's `usage` into a provider-neutral `RequestCost` record with a dollar amount. |
 | `app/api/agent/route.ts` | `GET /api/agent`, which runs the agent with the prompt _"Complete my tasks."_ |
-| `app/page.tsx` | Scratch page used while building: lists monday.com's tools and plays one RPS hand on every load. |
+| `app/page.tsx` | Homepage: a short description of the project and links to every API endpoint. |
 
 ### The rock-paper-scissors server
 
