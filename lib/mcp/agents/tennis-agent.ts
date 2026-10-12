@@ -16,7 +16,7 @@ import { createStdioClient } from '../clients/stdio';
 const BOARD_ID = 1151042058;
 
 // The only monday.com tools the agent is given. Everything else is filtered out.
-const MONDAY_TOOLS = ['change_item_column_values'];
+const MONDAY_TOOLS = ['change_item_column_values', 'create_update'];
 
 const system = `You complete tasks from the user's monday.com board.
 
@@ -26,7 +26,14 @@ The user's message lists the open tasks on board ${BOARD_ID}. For each task:
 - Don't change any other column, item or board.
 - If a task can't be done with your tools, leave it unchanged and explain why.
 
-When finished, summarize what you completed and anything you skipped.`;
+When picking a tennis slot:
+- Tool times are UTC. The user is in London, so give times in London time.
+- Only choose a session the user is free for. Prefer one with dry weather.
+- For the chosen session, give its name, London time, places left and booking URL, plus one line each on whether the user is free and what the weather will be.
+- If there is only one session with places, say so instead of calling it the best of several.
+- If a tool returns an error, say which tool failed and what it said. Don't present a choice as checked against data you didn't get.
+- When the task is complete, post the result as a comment with create_update: the task's itemId, and a body in HTML (<p>, <ul>, <li>, <strong>, <a>), not markdown. Don't mention anyone., summarize what you completed and anything you skipped.
+- Then set its status to Done with change_item_column_values`;
 
 type BoardItem = {
   id: string;
@@ -89,17 +96,27 @@ export async function runAnthropicTennisAgent(
 
   const client = new Anthropic();
 
-  const monday = await createMondayClient();
+  // Checked before connecting, so a missing value stops the run here instead of
+  // the server starting without it and the agent working around a failed tool.
+  const calendarUrl = process.env.GOOGLE_CALENDAR_ICS_URL;
+  if (!calendarUrl) throw new Error('GOOGLE_CALENDAR_ICS_URL is not set');
 
-  const { clients, close } = await connectAll([
+  // Clients come back in the order listed. monday.com is kept apart from the
+  // servers so only its allowlisted tools are given to the agent.
+  const {
+    clients: [monday, ...servers],
+    close,
+  } = await connectAll([
+    createMondayClient,
     () => createStdioClient('tennis'),
-    () => createStdioClient('calendar'),
+    () =>
+      createStdioClient('calendar', { GOOGLE_CALENDAR_ICS_URL: calendarUrl }),
     () => createStdioClient('weather'),
   ]);
   try {
     const tools = (
       await Promise.all(
-        clients.map(async (c) =>
+        servers.map(async (c) =>
           mcpTools((await c.listTools()).tools, toMcpClientLike(c)),
         ),
       )
@@ -147,7 +164,6 @@ export async function runAnthropicTennisAgent(
     error = err instanceof Error ? err.message : String(err);
   } finally {
     await close();
-    await monday.close();
   }
 
   // Summarised on failure too: requests made before an error are still billed.

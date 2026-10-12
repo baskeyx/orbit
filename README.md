@@ -41,31 +41,9 @@ The ticket is **"Pick the best possible slot for tennis over the next week"**. T
 
 All three tools take the same `{ start, end }` window (`lib/mcp/servers/time-window.ts`, in UTC), so the agent can pass one window to each. Run it with `GET /api/agent2`.
 
-### Run 1: the agent thought it was January 2025
+The model has no clock, so the first run guessed a date from its training data and searched January 2025. `app/api/agent2/route.ts` now puts the current London and UTC time in the user message.
 
-```
-→ get_busy_times       { start: '2025-01-09T00:00:00Z', end: '2025-01-16T23:59:59Z' }
-→ get_weather_forecast { start: '2025-01-09T00:00:00Z', end: '2025-01-16T23:59:59Z' }
-→ get_tennis_sessions  { start: '2025-01-09T00:00:00Z', end: '2025-01-16T23:59:59Z' }
-```
-
-> I cannot access your Google Calendar availability because the calendar integration isn't configured on your system. The weather service is currently unavailable for Clissold Park. There are no available adult tennis sessions at Clissold Park during the week of January 9-16, 2025…
-
-The model has no clock. Asked about "the next week" with no date given, it guessed one from its training data. All three failures came from that guess, except the calendar one:
-
-- **Weather:** Open-Meteo's forecast endpoint rejects dates in the past.
-- **Tennis:** there were no sessions in January 2025 to find.
-- **Calendar:** a separate bug, covered below.
-
-**Fix:** `app/api/agent2/route.ts` adds the current time to the user message, in London time and in UTC:
-
-```ts
-`${prompt}, it is now ${today} in London (${now.toISOString()} UTC).`
-```
-
-It goes in the user message rather than `system` because prompt caching reads the prefix in order (tools → system → messages). A timestamp in `system` would change every run and stop the tools and system prompt from being cached. Both time zones are given because the tools take UTC, but "Friday morning" means London time, and the clocks change at the end of October.
-
-### Run 2: a right answer, partly by luck
+### Result
 
 > **Best Tennis Slot Identified:**
 > - **Friday, October 16, 2026 at 09:00-10:00 UTC (10:00-11:00 AM London time)**
@@ -75,37 +53,28 @@ It goes in the user message rather than `system` because prompt caching reads th
 >
 > **Note:** This is the only adult tennis session with available places during the week. While the weather shows light rain showers that morning (27% chance, 11.2°C), conditions improve by mid-afternoon.
 
-Calling the underlying functions directly confirmed the answer. That was the only adult session with places left that week, and nothing in the calendar overlapped it.
+The answer was right: calling the underlying functions directly confirmed it was the only adult session with places left that week. The summary could still be better:
 
-But the agent never saw the calendar. Calling `get_busy_times` through the MCP client, as the agent does, still returns:
-
-```
-GOOGLE_CALENDAR_ICS_URL is not set
-```
-
-`StdioClientTransport` doesn't pass the parent's environment to the server it starts. It only passes a short default list (`HOME`, `PATH`, `USER`, `SHELL`, `TERM` and a few others). Next.js loads `.env` into its own process, so the agent and the Monday client can see their keys, but the calendar server is started without `GOOGLE_CALENDAR_ICS_URL`. In run 1 the model reported this error. In run 2 it said it had "analyzed… your calendar availability" without mentioning that the call failed. The calendar happened to be free on Friday morning, so the answer was still right.
-
-**Fix (still to do):** pass each server only the variables it needs, through the transport's `env` option:
-
-```ts
-createStdioClient('calendar', {
-  GOOGLE_CALENDAR_ICS_URL: process.env.GOOGLE_CALENDAR_ICS_URL,
-});
-```
-
-Passing `env: process.env` would also work, but it would give every server the Anthropic and monday.com keys too.
-
-### What run 2 could do better
-
-- **Say what it checked.** "Analyzed your calendar" hid a failed tool call. The system prompt should ask for one line per factor: whether the user is free, the weather, and the places left.
+- **Say what it checked.** It didn't say whether the user was free at that time.
 - **Keep the booking link.** The tool returned the session URL, but the summary just said "Available via Clubspark".
 - **Say when there's no choice to make.** With only one session that week, the weather and calendar couldn't change the answer. The tennis server could also return court bookings to give the agent real options.
+
+These are now in the tennis agent's own system prompt (`lib/mcp/agents/tennis-agent.ts`). For the chosen session, it gives the name, London time, places left and booking URL, plus a line each on whether the user is free and the weather. It says when there's only one session. If a tool fails, it says which tool and what the error was.
+
+### Passing secrets to stdio servers
+
+`StdioClientTransport` doesn't pass the app's environment to the servers it starts, only a short default list (`HOME`, `PATH` and so on). So the agent reads `GOOGLE_CALENDAR_ICS_URL`, checks it's set, and passes it to the calendar server alone:
+
+```ts
+createStdioClient('calendar', { GOOGLE_CALENDAR_ICS_URL: calendarUrl });
+```
+
+This works like the monday.com client: the host holds the secrets and gives each server only what it needs. An HTTP server gets a token with every request (`authProvider`). A stdio server gets its secrets as env variables when it starts.
 
 ### Lessons
 
 - **Give the agent the date.** It doesn't know it, and it won't say it's guessing.
-- **A plausible answer isn't a verified one.** Check the tool results, not just the summary. The run log (`→ tool { args }`) only shows calls, so log each tool result's `isError` too.
-- **Child processes don't get your `.env`.** Stdio servers only get the default environment plus whatever you pass them.
+- **Check the tool results, not just the summary.** A plausible answer isn't necessarily a verified one.
 
 ## Installation
 
@@ -169,7 +138,7 @@ Before the loop starts, the app fetches the board's open tasks itself. That step
 | `lib/mcp/servers/rps-server.ts` | An MCP server exposing a `play` tool. Uses `StdioServerTransport`, so it runs as a standalone process and communicates over stdin/stdout. |
 | `lib/mcp/servers/{tennis,calendar,weather}.ts` | The tennis example's MCP servers, one tool each. They're thin wrappers around `lib/tennis/clubspark.ts`, `lib/calendar/google.ts` and `lib/weather/openMeteo.ts`. |
 | `lib/mcp/servers/time-window.ts` | The shared `{ start, end }` input schema. It rejects a window where `end` isn't after `start`, which would otherwise return nothing and look like "free". |
-| `lib/mcp/clients/stdio.ts` | `createStdioClient(server)`: one factory for all the local servers. Launches `lib/mcp/servers/<server>.ts` as a child process with `npx tsx`. |
+| `lib/mcp/clients/stdio.ts` | `createStdioClient(server, env)`: one factory for all the local servers. Launches `lib/mcp/servers/<server>.ts` as a child process with `npx tsx`, passing only the env variables it's given. |
 | `lib/mcp/clients/connect.ts` | `connectAll()`: connects several clients in parallel and returns one `close()`. If any connection fails, it closes the ones that succeeded so no child process is left running. |
 | `lib/mcp/clients/monday.ts` | MCP client for monday.com's hosted server, over Streamable HTTP, authenticated with `MONDAY_API_TOKEN` as a bearer token. It has its own file because it uses a different transport and needs auth. |
 | `lib/mcp/agents/anthropic.ts` | The RPS agent. Fetches the open tasks, filters monday.com's tools down to an allowlist, and runs Claude through `client.beta.messages.toolRunner()`, logging each request's cost. |
@@ -273,7 +242,7 @@ try {
 
 - **Never `console.log` in a stdio MCP server.** stdout is the protocol channel, so a stray log line breaks the connection. Use `console.error` instead.
 - **Each client launches a new process.** Every stdio client starts a fresh server process (about a second each with `npx tsx`, which is why `connectAll()` connects them in parallel), so always call `close()` (in a `finally` block) to shut them down.
-- **Stdio servers don't inherit your `.env`.** `StdioClientTransport` only passes a default set of variables (`HOME`, `PATH` and so on). Pass anything else a server needs through the transport's `env` option. See [run 2](#run-2-a-right-answer-partly-by-luck).
+- **Stdio servers don't inherit your `.env`.** `StdioClientTransport` only passes a default set of variables (`HOME`, `PATH` and so on). Pass anything else a server needs through the transport's `env` option. See [Passing secrets to stdio servers](#passing-secrets-to-stdio-servers).
 - **The model doesn't know today's date.** Put it in the prompt, or relative requests like "next week" fall back to a date from the model's training data.
 - **Tool names must be unique across servers.** `mcpTools()` passes names through unchanged, so give each tool a name that includes its domain (`get_tennis_sessions`, not `get_sessions`).
 - **The client's `name` and `version` identify the app, not the server.** They're sent as `clientInfo` when the connection starts, so every client uses `orbit` / `0.1.0`. Each server reports its own name back as `serverInfo`. This also means the stdio setup only works where the app can spawn processes (local dev or your own server), not on serverless hosting.
@@ -290,7 +259,7 @@ try {
 - Return each run's costs from `/api/agent` and save them, so runs can be compared over time.
 - Try the same MCP servers with an OpenAI agent to compare providers.
 - Move `rps-server.ts` to Streamable HTTP so it can be deployed and connected to by URL.
-- Pass `GOOGLE_CALENDAR_ICS_URL` to the calendar server through `createStdioClient`'s transport `env`.
-- Give the tennis agent its own system prompt asking it to justify the chosen slot on each factor (free, weather, places left) and to include the booking URL.
+- Rerun the tennis agent with the calendar working and the new prompt, and add the result here.
+- For a hosted version that others can use with their own calendars: replace the single `GOOGLE_CALENDAR_ICS_URL` with Google sign-in, and move the calendar server to Streamable HTTP so each request carries the user's token (as monday.com's server does).
 - Log each tool result's `isError`, not just the calls, so a failed tool can't be hidden by a confident summary.
 - Make the weather tool's error say that dates must be within the next ~15 days, so the model can correct a bad window itself.
